@@ -2,9 +2,12 @@ import telebot
 import os
 import random
 import json
+import difflib
 import subprocess
 
 TOKEN = os.getenv("BOT_TOKEN")
+PASSWORD = os.getenv("BOT_PASSWORD")
+
 bot = telebot.TeleBot(TOKEN)
 
 DATA_FILE = "data.json"
@@ -16,7 +19,8 @@ if not os.path.exists(DATA_FILE):
             "mode": "text",
             "auto_extract": False,
             "learned": {},
-            "stickers": []
+            "stickers": [],
+            "groups": {}
         }, f)
 
 def load_data():
@@ -27,80 +31,73 @@ def save_data(data):
     with open(DATA_FILE, "w") as f:
         json.dump(data, f)
 
-def is_admin(user_id):
-    data = load_data()
-    return user_id in data["admins"]
-
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.reply_to(message, "ربات فعاله.")
-
-@bot.message_handler(commands=['help'])
-def help_cmd(message):
-    bot.reply_to(message, "/teach /work /setmode /addadmin /deladmin /setautoextract")
-
-@bot.message_handler(commands=['addadmin'])
-def add_admin(message):
-    if not is_admin(message.from_user.id) and len(load_data()["admins"]) > 0:
-        return
-    try:
-        user_id = int(message.text.split()[1])
-        data = load_data()
-        if user_id not in data["admins"]:
-            data["admins"].append(user_id)
-            save_data(data)
-            bot.reply_to(message, "ادمین اضافه شد.")
-    except:
-        pass
-
-@bot.message_handler(commands=['deladmin'])
-def del_admin(message):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        user_id = int(message.text.split()[1])
-        data = load_data()
-        if user_id in data["admins"]:
-            data["admins"].remove(user_id)
-            save_data(data)
-            bot.reply_to(message, "ادمین حذف شد.")
-    except:
-        pass
-
-@bot.message_handler(commands=['setmode'])
-def set_mode(message):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        mode = message.text.split()[1]
-        if mode in ["text", "voice"]:
-            data = load_data()
-            data["mode"] = mode
-            save_data(data)
-            bot.reply_to(message, "حالت تنظیم شد.")
-    except:
-        pass
-
-@bot.message_handler(commands=['setautoextract'])
-def set_auto(message):
-    if not is_admin(message.from_user.id):
-        return
-    try:
-        state = message.text.split()[1]
-        data = load_data()
-        data["auto_extract"] = True if state == "on" else False
-        save_data(data)
-        bot.reply_to(message, "تنظیم شد.")
-    except:
-        pass
-
 pending_teach = {}
+pending_group_auth = {}
+
+def is_group_active(chat_id):
+    data = load_data()
+    group = data["groups"].get(str(chat_id))
+    return group and group.get("active") == True
+
+@bot.message_handler(content_types=['new_chat_members'])
+def bot_added(message):
+    for member in message.new_chat_members:
+        if member.id == bot.get_me().id:
+            data = load_data()
+            data["groups"][str(message.chat.id)] = {
+                "active": False,
+                "owner": message.from_user.id,
+                "attempts": 0,
+                "locked": False
+            }
+            save_data(data)
+
+            pending_group_auth[message.from_user.id] = message.chat.id
+
+            bot.send_message(
+                message.chat.id,
+                "برای فعالسازی ربات، به پیوی من برو و رمز را وارد کن."
+            )
+
+@bot.message_handler(func=lambda m: m.chat.type == "private")
+def private_auth(message):
+    user_id = message.from_user.id
+    data = load_data()
+
+    if user_id in pending_group_auth:
+        group_id = pending_group_auth[user_id]
+        group = data["groups"].get(str(group_id))
+
+        if group["locked"]:
+            bot.reply_to(message, "این گروه قفل شده.")
+            return
+
+        if message.text == PASSWORD:
+            group["active"] = True
+            save_data(data)
+            del pending_group_auth[user_id]
+            bot.reply_to(message, "ربات فعال شد.")
+            bot.send_message(group_id, "ربات فعال شد ✅")
+        else:
+            group["attempts"] += 1
+            if group["attempts"] >= 3:
+                group["locked"] = True
+                bot.reply_to(message, "۳ بار اشتباه. گروه قفل شد.")
+                bot.send_message(group_id, "گروه قفل شد ❌")
+            save_data(data)
+        return
 
 @bot.message_handler(commands=['teach'])
 def teach(message):
+    if message.chat.type in ["group", "supergroup"]:
+        if not is_group_active(message.chat.id):
+            return
     try:
         key = message.text.split(" ", 1)[1]
-        pending_teach[message.from_user.id] = key
+        pending_teach[message.from_user.id] = {
+            "key": key,
+            "reply_required": True if message.reply_to_message else False
+        }
         bot.reply_to(message, "پاسخ رو بفرست.")
     except:
         pass
@@ -108,75 +105,57 @@ def teach(message):
 @bot.message_handler(content_types=['text', 'voice', 'video', 'sticker'])
 def handle_all(message):
     data = load_data()
+
+    if message.chat.type in ["group", "supergroup"]:
+        if not is_group_active(message.chat.id):
+            return
+
     user_id = message.from_user.id
 
     if user_id in pending_teach:
-        key = pending_teach[user_id]
+        teach_data = pending_teach[user_id]
+        key = teach_data["key"]
+        reply_required = teach_data["reply_required"]
+
         if message.content_type == "text":
-            data["learned"][key] = {"type": "text", "content": message.text}
-        elif message.content_type == "voice":
-            file_info = bot.get_file(message.voice.file_id)
-            downloaded = bot.download_file(file_info.file_path)
-            path = f"{key}.ogg"
-            with open(path, "wb") as f:
-                f.write(downloaded)
-            data["learned"][key] = {"type": "voice", "content": path}
+            data["learned"][key] = {
+                "type": "text",
+                "content": message.text,
+                "reply_required": reply_required
+            }
+
         save_data(data)
         del pending_teach[user_id]
         bot.reply_to(message, "یاد گرفتم.")
         return
 
-    if message.text:
+    if message.content_type == "text":
         text = message.text
 
-        if message.chat.type in ["group", "supergroup"]:
-            if text == "/work":
-                members = bot.get_chat_administrators(message.chat.id)
-                users = [m.user.id for m in members]
-                if len(users) >= 2:
-                    u1, u2 = random.sample(users, 2)
-                    bot.send_message(message.chat.id, "رابرت بیا کارت دارم", reply_to_message_id=message.message_id)
-                    bot.send_message(message.chat.id, "این گوتم با خودت بیار", reply_to_message_id=message.message_id)
-                return
+        if "گم شو" in text:
+            if message.reply_to_message:
+                bot.send_message(
+                    message.chat.id,
+                    "سیهدیر",
+                    reply_to_message_id=message.reply_to_message.message_id
+                )
+            else:
+                bot.reply_to(message, "سیهدیر")
 
-        if "مارکوس" in text:
-            bot.reply_to(message, "ندع رابرت")
-        elif "دوست دارم مارکوس" in text:
-            bot.reply_to(message, "اگه پشه بودم باز دوسم داشتی؟")
-        elif "مارکوس ماشینت چیشده" in text:
-            bot.reply_to(message, "من اشتباهی تو باک تویوتا کم چرپ ریختم")
-        elif "چه فرقی داره" in text:
-            bot.reply_to(message, "از شیر پر چرپ بهتره")
-        elif "گم شو" in text:
-            bot.reply_to(message, "سیهدیر")
-
-        if text in data["learned"]:
-            item = data["learned"][text]
-            if item["type"] == "text":
-                bot.reply_to(message, item["content"])
-            elif item["type"] == "voice" and data["mode"] == "voice":
-                with open(item["content"], "rb") as v:
-                    bot.send_voice(message.chat.id, v, reply_to_message_id=message.message_id)
-
-        if data["stickers"]:
-            bot.send_sticker(message.chat.id, random.choice(data["stickers"]))
-
-    if message.content_type == "sticker":
-        if message.chat.type == "private":
-            data["stickers"].append(message.sticker.file_id)
-            save_data(data)
-
-    if message.content_type == "video":
-        file_info = bot.get_file(message.video.file_id)
-        downloaded = bot.download_file(file_info.file_path)
-        video_path = "video.mp4"
-        with open(video_path, "wb") as f:
-            f.write(downloaded)
-
-        audio_path = "audio.ogg"
-        subprocess.run(["ffmpeg", "-i", video_path, "-vn", "-acodec", "copy", audio_path])
-
-        with open(audio_path, "rb") as a:
-            bot.send_voice(message.chat.id, a)
+        if data["learned"]:
+            closest = difflib.get_close_matches(text, data["learned"].keys(), n=1, cutoff=0.6)
+            if closest:
+                item = data["learned"][closest[0]]
+                if item.get("reply_required") and not message.reply_to_message:
+                    return
+                if item["type"] == "text":
+                    if message.reply_to_message:
+                        bot.send_message(
+                            message.chat.id,
+                            item["content"],
+                            reply_to_message_id=message.reply_to_message.message_id
+                        )
+                    else:
+                        bot.reply_to(message, item["content"])
 
 bot.polling(non_stop=True)
